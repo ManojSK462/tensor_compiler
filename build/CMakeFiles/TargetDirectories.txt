@@ -1,0 +1,4 @@
+K:/tensor_compiler/build/CMakeFiles/edit_cache.dir
+K:/tensor_compiler/build/CMakeFiles/tc.dir
+K:/tensor_compiler/build/CMakeFiles/test_m0.dir
+K:/tensor_compiler/build/CMakeFiles/rebuild_cache.dir

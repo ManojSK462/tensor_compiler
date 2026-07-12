@@ -25,99 +25,202 @@ src/
   printer.cpp  — text printer, Graphviz DOT printer
 
 tests/
-  test_m0.cpp  — 7 tests: MLP layer, elementwise chain, softmax,
-                  reshape/transpose, 2-layer MLP, reductions, DOT file
+  test_m0.cpp  — 7 tests
+```
 
-CMakeLists.txt — C++17 static lib (tc) + test_m0 executable
+### Key design choices
+
+- Builder infers shapes inline. `infer_shapes` pass re-verifies.
+- `TensorId` = vector index. Stable, O(1) lookup. Never removed.
+- `Attributes` is a flat struct covering all op-specific fields.
+- Full NumPy broadcast rules in `broadcast_shapes()`.
+- `OpRegistry` is a Meyers singleton. Call `register_all_ops()` once before any graph.
+- `tanh_` / `exp_` use trailing underscore to avoid `std::` name collision.
+
+### Deviations from design doc
+
+- `LowerFn` not on `OpSpec` in M0 — added at M1 when Loop IR is defined.
+- `Group` on `Node` always `kNoGroup` — filled by M2 fusion pass.
+
+---
+
+## M1 — Naive end-to-end  ✅
+
+### What was built
+
+Loop IR, naive lowering for all 15 ops, C++/OpenMP codegen, compile+run+verify harness. A small MLP compiles, runs, and matches a reference implementation within fp tolerance.
+
+### New files
+
+```
+include/tc/
+  loop_ir.hpp  — Buffer, Loop, LoopNest, LoopProgram
+  lower.hpp    — lower_naive(Graph) -> LoopProgram
+  codegen.hpp  — emit_cpp(LoopProgram) -> std::string
+  runtime.hpp  — compile_and_run(src, prog, inputs) -> RunResult
+
+src/
+  loop_ir.cpp  — LoopProgram::add_buffer
+  lower.cpp    — walks graph nodes, dispatches lower_naive per op
+  codegen.cpp  — emits kernel functions + standalone main()
+  runtime.cpp  — writes to generated/, compiles via bat+cl.exe, runs
+
+tests/
+  test_m1.cpp  — matmul→add→relu and elementwise chain, verified vs reference
+
+generated/     — runtime writes tc_gen.cpp, tc_gen.exe, compile.bat, run.bat, *.bin here
 ```
 
 ### How to build and run
 
 ```bat
-:: Requires VS 2019 Build Tools (cl.exe + bundled cmake)
 call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 cmake -S K:\tensor_compiler -B K:\tensor_compiler\build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug
 cmake --build K:\tensor_compiler\build
-K:\tensor_compiler\build\test_m0.exe
+K:\tensor_compiler\build\test_m1.exe
 ```
 
-### Key design choices
-
-**TensorId = vector index.**
-`Graph::tensors` is a plain `std::vector<TensorInfo>`. `TensorId` is the index.
-Tensors are never removed, so IDs are stable. Same for `NodeId` → `Graph::nodes`.
-
-**Builder infers shapes inline.**
-Every `add_op(kind, inputs, attrs)` call immediately runs `OpSpec::infer_shape`,
-creates the output tensor with the computed shape, and appends the node.
-`infer_shapes()` as a pass re-verifies consistency — it's a foundation for
-loading graphs from external sources (ONNX) where shapes may be absent at build time.
-
-**Op registry is a Meyers singleton.**
-Call `register_all_ops()` once before any graph is built. After that the registry
-is read-only.
-
-**`OpSpec::scalar_expr` stores the per-element C++ expression as a closure.**
-Example: `Relu` → `"(v > 0.f ? v : 0.f)"`. These strings are not used in M0 —
-they will be composed and emitted verbatim into generated kernel bodies at M2+.
-
-**`Attributes` is a flat struct, not a map.**
-Covers all op-specific parameters: `axis`, `trans_a/b`, `target_shape`, `perm`.
-Simple and fast for v1. Not general but sufficient.
-
-**Full NumPy broadcast rules.**
-`broadcast_shapes(a, b)`: right-align dims (prepend 1s to shorter shape), then
-per-dim: equal → keep, one is 1 → take the other, else throw. Broadcast dims
-become stride-0 indices in emitted kernels (M2+).
-
-**`tanh_` / `exp_` naming.**
-Trailing underscore avoids `std::tanh`/`std::exp` name collision in translation
-units that include `<cmath>`.
-
-**`validate()` checks four invariants:**
-1. Node id matches its position in `nodes` (topological order is maintained).
-2. Every node's input tensors are defined before the node (SSA / topo order).
-3. Every non-input tensor has exactly one producer (SSA single-definition).
-4. Every tensor dim is strictly positive.
-
-### What M0 demonstrates
+### How the pipeline works end-to-end
 
 ```
-Graph g;
-auto x = g.input({8, 32});
-auto W = g.input({32, 64});
-auto b = g.input({64});
-auto y = g.relu(g.add(g.matmul(x, W), b));
-g.mark_output(y);
-infer_shapes(g);   // verifies shapes
-validate(g);       // asserts invariants
-print_text(g, std::cout);          // human-readable
-print_dot(g, std::ofstream("out.dot"));  // Graphviz
+Graph  →  lower_naive()  →  LoopProgram  →  emit_cpp()  →  C++ source string
+                                                                    ↓
+                                                        written to generated/tc_gen.cpp
+                                                                    ↓
+                                                        compile.bat (vcvars64 + cl.exe /O2)
+                                                                    ↓
+                                                        tc_gen.exe (standalone binary)
+                                                                    ↓
+                                               run.bat (passes binary input files, captures output)
+                                                                    ↓
+                                               read back output .bin → compare vs reference
 ```
 
-Output (text):
-```
-Graph {
-  inputs:  t0 [8,32]:f32  t1 [32,64]:f32  t2 [64]:f32
-  nodes:
-    n0  matmul(t0, t1) -> t3[8,64]  [contraction]
-    n1  add(t3, t2) -> t4[8,64]  [elementwise]
-    n2  relu(t4) -> t5[8,64]  [elementwise]
-  outputs:  t5[8,64]:f32
-}
+### Loop IR design
+
+`LoopNest` has:
+- `loops`: ordered list of `Loop {var, extent, tag}` — only the outer loops. Tags: Serial, Parallel, Vectorize, Reduce.
+- `body`: a string of C++ that goes inside all the loops verbatim.
+
+For matmul, the reduction `k` loop is embedded in `body` (not in `loops`). This is intentional for M1 — at M3 the matmul lowering will be restructured for tiling.
+
+### LowerFn signature
+
+```cpp
+using LowerFn = std::function<LoopNest(
+    const std::vector<BufferId>& ins,
+    BufferId out,
+    const Attributes& attrs,
+    const LoopProgram& prog)>;
 ```
 
-DOT output can be rendered with `dot -Tpng out.dot -o out.png`.
+The LowerFn reads buffer shapes from `prog.buffers[id]` to construct index expressions. Kernel id and name are assigned by `lower.cpp` after the fn returns (not inside the fn).
+
+### Key lowering decisions
+
+- **Elementwise**: one loop per output dimension, outer dim tagged Parallel. Broadcast handled by `bcast_flat_idx` — maps input dims to output loop vars, substituting "0" for broadcast dims (stride-0 semantics).
+- **Matmul**: loops [i(Parallel), j(Serial)], k loop embedded in body. Shapes taken from output buffer.
+- **Reductions (sum/max/mean)**: outer dims parallel, reduction loop in body. Mean divides by axis size in the final assignment.
+- **Softmax**: two-pass (max for numerical stability, then exp+normalize) in body; outer dims parallel.
+- **View ops (reshape/transpose/broadcast)**: flat element-wise copy. Correct but suboptimal — at M2+ these are folded into index expressions instead.
+
+### Codegen structure
+
+`emit_cpp` generates a standalone C++ binary with:
+- One `static void kernel_N(const float* read_bufs..., float* write_bufs...)` per LoopNest.
+- `main(argc, argv)`: reads external buffers from binary files (argv[1..N]), runs kernels, writes output buffers to binary files (argv[N+1..]).
+
+### Runtime (Windows-specific)
+
+- Generated files go to `K:\tensor_compiler\generated\` (not `%TEMP%` — avoids sandbox path issues).
+- `compile.bat`: calls `vcvars64.bat` then `cl.exe /O2`.
+- `run.bat`: invokes the compiled exe with quoted binary file paths (bat file avoids cmd.exe quoting quirks from `system()` with a leading `"`).
+- After compilation, checks exe exists before proceeding.
+
+### Correctness test
+
+`test_mlp_layer` computes reference output manually in C++ (triple loop for matmul, then add+relu) and compares element-wise against compiled output within `1e-4` tolerance. Both match on the same random inputs.
 
 ### Deviations from design doc
 
-- `LowerFn` fields (`lower_naive`, `lower_optimized`) are **not on `OpSpec` yet** —
-  they require Loop IR types which don't exist until M1.
-- `softmax` is a single `Reduction` node at the graph IR level; its two-pass
-  numerically-stable lowering is an M4 concern.
-- `Group` field on `Node` is present but always `kNoGroup` — filled by M2's fusion pass.
+- Codegen produces a standalone exe (file-based I/O), not a `.so` + `dlopen`. On Windows, `LoadLibrary`/`GetProcAddress` is the equivalent but the exe approach is simpler for M1.
+- View ops lower to a flat copy rather than being folded into index expressions — folding comes at M2 when we handle fusion and can inline views into consumer kernels.
+- No OpenMP at compile time yet (`/O2` only, no `/openmp`). `#pragma omp parallel for` is in the generated source but ignored. Enabled at M3 for benchmarking.
 
 ---
 
-*Next: M1 — Naive end-to-end. Define Loop IR, add `lower_naive` to OpSpec,
-emit C++/OpenMP source for each op, compile + run + verify harness.*
+---
+
+## M2 — Elementwise fusion  ✅
+
+### What was built
+
+Greedy elementwise fusion pass, fused lowering that composes scalar expressions into a single kernel body, and an analytical memory-traffic savings estimator.
+
+### New files
+
+```
+include/tc/
+  fusion.hpp   — fuse(Graph&)
+  analyze.hpp  — TrafficStats, analyze_savings
+
+src/
+  fusion.cpp   — greedy vertical fusion pass
+  analyze.cpp  — memory-traffic model
+  lower.cpp    — extended with lower_fused(Graph&)
+
+tests/
+  test_m2.cpp  — 4 tests
+```
+
+### Fusion algorithm
+
+`fuse(Graph&)` runs in topological order:
+
+1. Assign every node its own singleton group (`node.group = node.id`).
+2. For each elementwise node N, for each input tensor from an elementwise producer P:
+   - Skip if P has class ≠ Elementwise, or the tensor has multiple consumers, or P's output shape ≠ N's output shape.
+   - Merge P's entire group into N's group.
+3. Non-elementwise nodes (Contraction, Reduction, View) each stay in their own singleton group.
+
+Multi-consumer check (`consumers_of(t).size() != 1`) is the key legality gate. Shape equality is required for the composed iteration space to be well-defined.
+
+### Fused lowering
+
+`lower_fused(Graph&)` processes each group in topological order:
+
+- **All-elementwise group**: emits one `LoopNest`. Loops over the output shape. Body string is built by walking the group's nodes in topological order: external tensors become buffer reads (with broadcast index), internal tensors (produced inside the group) become `float _tN = expr;` locals, and the group output becomes the final buffer write. No intermediate buffer is ever allocated.
+- **Non-elementwise singleton group**: delegates to `spec.lower_naive` exactly as `lower_naive` does.
+
+The body indentation: continuation lines use `4 * (1 + rank)` spaces to match the depth `emit_loops` assigns to the innermost loop body, keeping generated code correctly formatted.
+
+### Analytical savings
+
+`analyze_savings(Graph&)` (called after `fuse()`):
+
+```
+bytes_unfused = Σ over nodes:   Σ bytes(input tensors) + bytes(output tensor)
+bytes_fused   = Σ over groups:  Σ bytes(external reads) + Σ bytes(external writes)
+bytes_saved   = bytes_unfused − bytes_fused
+```
+
+Internal-to-group tensors contribute to `bytes_unfused` (they'd round-trip in the unfused case) but not to `bytes_fused` (they stay in registers). The difference is the reported saving.
+
+### Test results
+
+| Test | Result |
+|---|---|
+| `test_elementwise_chain_fuses` | relu+sigmoid fuse to 1 kernel; fused output matches naive |
+| `test_multi_consumer_no_fuse` | relu with 2 consumers stays in its own group |
+| `test_analyze_savings` | gelu+relu+sigmoid: unfused=3 KB, fused=1 KB, saved=2 KB |
+| `test_mlp_partial_fuse` | matmul singleton + add+relu fused; 2 kernels; matches naive |
+
+### Deviations from design doc
+
+- Shape equality (not just broadcast-compatibility) is required for fusion. Cross-shape elementwise fusion (e.g., fusing a [1,N] producer into a [M,N] consumer) is deferred to M3 when epilogue fusion makes it necessary.
+- Prologue fusion (folding an elementwise producer into a contraction's load) is deferred to M3+.
+- View folding into index expressions is deferred; views still lower as copy kernels.
+
+---
+
+*Next: M3 — Tiled matmul schedule, epilogue fusion onto the matmul anchor.*

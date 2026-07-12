@@ -1,5 +1,6 @@
 #pragma once
 #include "types.hpp"
+#include "loop_ir.hpp"
 #include <functional>
 #include <unordered_map>
 
@@ -30,6 +31,8 @@ struct Attributes {
 
 using ShapeFn      = std::function<Shape(const std::vector<Shape>&, const Attributes&)>;
 using ScalarExprFn = std::function<std::string(const std::vector<std::string>&)>;
+using LowerFn      = std::function<LoopNest(const std::vector<BufferId>&, BufferId,
+                                             const Attributes&, const LoopProgram&)>;
 
 struct OpSpec {
     OpKind        kind;
@@ -37,6 +40,7 @@ struct OpSpec {
     int           arity;
     ShapeFn       infer_shape;
     ScalarExprFn  scalar_expr;
+    LowerFn       lower_naive;
 };
 
 class OpRegistry {

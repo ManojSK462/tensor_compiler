@@ -1,0 +1,10 @@
+build/
+generated/
+.claude/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+test_m1_gen.cpp
+test_m0_mlp.dot

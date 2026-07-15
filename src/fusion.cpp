@@ -3,13 +3,18 @@
 #include <unordered_set>
 #include <vector>
 
+static bool is_anchor(const Node& n) {
+    if (n.cls == OpClass::Contraction) return true;
+    if (n.cls == OpClass::Reduction && n.kind != OpKind::Softmax) return true;
+    return false;
+}
+
 static bool group_has_anchor(const std::unordered_map<GroupId, std::vector<NodeId>>& groups,
                               const Graph& g, GroupId gid) {
     auto it = groups.find(gid);
     if (it == groups.end()) return false;
     for (NodeId nid : it->second)
-        if (g.nodes[nid].cls == OpClass::Contraction || g.nodes[nid].cls == OpClass::Reduction)
-            return true;
+        if (is_anchor(g.nodes[nid])) return true;
     return false;
 }
 
@@ -44,8 +49,7 @@ void fuse(Graph& g) {
 
             NodeId anchor_nid = kInvalidNode;
             for (NodeId mid : groups[prod_gid])
-                if (g.nodes[mid].cls == OpClass::Contraction || g.nodes[mid].cls == OpClass::Reduction)
-                    { anchor_nid = mid; break; }
+                if (is_anchor(g.nodes[mid])) { anchor_nid = mid; break; }
 
             TensorId anchor_out = g.nodes[anchor_nid].outputs[0];
             if (g.tensors[g.nodes[ni].outputs[0]].shape != g.tensors[anchor_out].shape) continue;

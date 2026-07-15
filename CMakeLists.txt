@@ -35,3 +35,6 @@ target_link_libraries(test_m2 PRIVATE tc)
 
 add_executable(test_m3 tests/test_m3.cpp)
 target_link_libraries(test_m3 PRIVATE tc)
+
+add_executable(test_m4 tests/test_m4.cpp)
+target_link_libraries(test_m4 PRIVATE tc)

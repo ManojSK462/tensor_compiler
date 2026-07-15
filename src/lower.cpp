@@ -124,9 +124,11 @@ LoopProgram lower_fused(const Graph& g) {
 
         bool all_ew = true;
         bool has_contraction = false;
+        bool has_reduction   = false;
         for (const Node* n : members) {
             if (n->cls != OpClass::Elementwise) all_ew = false;
             if (n->cls == OpClass::Contraction) has_contraction = true;
+            if (n->cls == OpClass::Reduction && n->kind != OpKind::Softmax) has_reduction = true;
         }
 
         std::unordered_set<NodeId> member_set;
@@ -299,6 +301,124 @@ LoopProgram lower_fused(const Graph& g) {
 
             if (epi_nodes.empty())
                 body << "\n        " << prog.buffers[out_bid].name << "[i * " << N_dim << " + j] = acc;";
+
+            nest.body = body.str();
+            nest.id   = static_cast<KernelId>(prog.kernels.size());
+            nest.name = "kernel_" + std::to_string(nest.id);
+            prog.kernels.push_back(std::move(nest));
+
+        } else if (has_reduction) {
+            const Node* anchor = nullptr;
+            std::vector<const Node*> epi_nodes;
+            for (const Node* n : members) {
+                if (n->cls == OpClass::Reduction) anchor = n;
+                else if (n->cls == OpClass::Elementwise) epi_nodes.push_back(n);
+            }
+
+            BufferId in_bid   = tensor_to_buf.at(anchor->inputs[0]);
+            Shape    in_shape = prog.buffers[in_bid].shape;
+            std::string in_name = prog.buffers[in_bid].name;
+
+            int64_t ax = anchor->attrs.axis;
+            if (ax < 0) ax += in_shape.rank();
+            int64_t red_ext = in_shape.dims[ax];
+
+            TensorId red_out_tid = anchor->outputs[0];
+
+            std::unordered_set<TensorId> produced_in_group;
+            produced_in_group.insert(red_out_tid);
+            for (const Node* n : epi_nodes)
+                for (TensorId t : n->outputs)
+                    produced_in_group.insert(t);
+
+            TensorId group_out_tid = find_group_output(members, member_set, g, is_graph_output);
+            const TensorInfo& out_ti = g.tensors[group_out_tid];
+            BufferRole role = is_graph_output(group_out_tid) ? BufferRole::Output
+                                                              : BufferRole::Intermediate;
+            BufferId out_bid = prog.add_buffer(out_ti.shape, out_ti.dtype, role,
+                                               "t" + std::to_string(group_out_tid));
+            tensor_to_buf[group_out_tid] = out_bid;
+
+            LoopNest nest;
+            std::vector<std::string> outer_vars;
+            for (int64_t i = 0; i < in_shape.rank(); ++i) {
+                if (i == ax) continue;
+                std::string v = "i" + std::to_string(i);
+                outer_vars.push_back(v);
+                LoopTag tag = (outer_vars.size() == 1) ? LoopTag::Parallel : LoopTag::Serial;
+                nest.loops.push_back({v, in_shape.dims[i], tag});
+            }
+
+            std::unordered_set<TensorId> seen_ext;
+            nest.reads.push_back(in_bid);
+            seen_ext.insert(anchor->inputs[0]);
+            for (const Node* n : epi_nodes)
+                for (TensorId t : n->inputs)
+                    if (!produced_in_group.count(t) && !seen_ext.count(t)) {
+                        nest.reads.push_back(tensor_to_buf.at(t));
+                        seen_ext.insert(t);
+                    }
+            nest.writes = {out_bid};
+
+            std::vector<std::string> in_vars;
+            int oi = 0;
+            for (int64_t i = 0; i < in_shape.rank(); ++i)
+                in_vars.push_back(i == ax ? "r" : outer_vars[oi++]);
+            std::string in_idx = flat_idx_fused(in_shape, in_vars);
+
+            bool do_normalize = (anchor->kind == OpKind::Mean);
+            std::string acc_init, acc_update;
+            if (anchor->kind == OpKind::Max) {
+                acc_init   = "-1e38f";
+                acc_update = "(acc > " + in_name + "[" + in_idx + "] ? acc : "
+                             + in_name + "[" + in_idx + "])";
+            } else {
+                acc_init   = "0.f";
+                acc_update = "acc + " + in_name + "[" + in_idx + "]";
+            }
+
+            std::ostringstream body;
+            body << "float acc = " << acc_init << ";\n";
+            body << "        for (int64_t r = 0; r < " << red_ext << "; ++r)\n";
+            body << "            acc = " << acc_update << ";";
+            if (do_normalize)
+                body << "\n        acc /= " << red_ext << ".f;";
+
+            std::unordered_set<TensorId> epi_produced;
+            epi_produced.insert(red_out_tid);
+            Shape out_shape = out_ti.shape;
+
+            for (const Node* n : epi_nodes) {
+                const OpSpec& spec = reg.get(n->kind);
+                std::vector<std::string> input_exprs;
+                for (TensorId t : n->inputs) {
+                    if (epi_produced.count(t)) {
+                        input_exprs.push_back(t == red_out_tid ? "acc"
+                                                               : "_ep" + std::to_string(t));
+                    } else {
+                        BufferId bid = tensor_to_buf.at(t);
+                        std::string idx = bcast_idx_fused(prog.buffers[bid].shape,
+                                                          out_shape, outer_vars);
+                        input_exprs.push_back(prog.buffers[bid].name + "[" + idx + "]");
+                    }
+                }
+                std::string expr = spec.scalar_expr(input_exprs);
+                TensorId out_t = n->outputs[0];
+                epi_produced.insert(out_t);
+                body << "\n        ";
+                if (out_t == group_out_tid) {
+                    std::string out_idx = flat_idx_fused(out_shape, outer_vars);
+                    body << prog.buffers[out_bid].name << "[" << out_idx << "] = " << expr << ";";
+                } else {
+                    body << "float _ep" << out_t << " = " << expr << ";";
+                }
+            }
+
+            if (epi_nodes.empty()) {
+                std::string out_idx = flat_idx_fused(out_shape, outer_vars);
+                body << "\n        " << prog.buffers[out_bid].name
+                     << "[" << out_idx << "] = acc;";
+            }
 
             nest.body = body.str();
             nest.id   = static_cast<KernelId>(prog.kernels.size());

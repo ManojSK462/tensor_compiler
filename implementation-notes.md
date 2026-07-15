@@ -293,3 +293,52 @@ The fused kernel is slower on this machine (no OpenMP, small matrix, Windows sub
 - OpenMP not enabled in `cl.exe` invocations (no `/openmp` flag). `#pragma omp parallel for` is present in generated code but ignored. This is why the fused kernel (which has more loop overhead from K-tiling) runs slower than naive.
 - K-tiling uses a fixed `KT=min(K,256)`. For K≤256, this produces a single tile (trivial tiling). Actual cache-locality benefit requires K>256.
 - Prologue fusion (elementwise producers before matmul) is deferred to M4+.
+
+---
+
+## M4 — Reduction epilogue fusion  ✅
+
+### What was built
+
+Extended the fusion pass and fused lowering to support reduction anchors (Sum, Max, Mean). Elementwise consumers of a reduction now fold into the same kernel via an `acc`-based epilogue, eliminating the intermediate buffer that would otherwise hold the reduction output. Softmax is intentionally excluded from anchor fusion — its three-pass body cannot cleanly inline an epilogue without recomputing exponentials.
+
+### Changed / new files
+
+```
+src/
+  fusion.cpp  — is_anchor() helper; excludes Softmax from anchor detection
+  lower.cpp   — has_reduction flag + new else-if branch in lower_fused
+
+tests/
+  test_m4.cpp — 5 tests: sum+relu, mean+mul, max+add, softmax correctness, benchmark
+```
+
+### Fusion extension
+
+`is_anchor(node)` returns true for `Contraction` or `Reduction && kind != Softmax`. Softmax groups remain singletons; their consumers, if any, stay as separate groups.
+
+### Reduction epilogue lowering
+
+The `has_reduction` branch in `lower_fused`:
+
+- Outer loops: all non-reduced dimensions of the input (first dim Parallel).
+- Body: `float acc = init; for (r=0; r<K; ++r) acc = update(acc, in[...]);`
+  - Sum/Mean: `acc + in[...]`, then `acc /= K` for Mean.
+  - Max: `(acc > in[...] ? acc : in[...])`.
+- Epilogue: same register-resident chain pattern as the contraction branch.
+- Buffer names and shapes copied before `prog.add_buffer` to prevent dangling-reference UB.
+
+### Test results
+
+| Test | Result |
+|---|---|
+| `test_sum_relu_fuses` | sum+relu → 1 kernel, matches naive |
+| `test_mean_mul_fuses` | mean+scale → 1 kernel, matches naive |
+| `test_max_add_fuses` | max+bias → 1 kernel, matches naive |
+| `test_softmax_correctness` | each row sums to 1 within 1e-4 |
+| `test_reduction_benchmark` (512×1024 sum+relu) | 4 KB saved; 0.64 ms naive → 0.54 ms fused, 1.19× speedup |
+
+### Deviations from design doc
+
+- Softmax epilogue fusion deferred — three-pass body would require recomputing exp to inline an epilogue.
+- Prologue fusion (elementwise producers before the reduction) deferred to M5+.

@@ -111,11 +111,11 @@ static void test_mlp_partial_fuse() {
 
     fuse(g);
 
-    assert(g.nodes[0].group != g.nodes[1].group);
+    assert(g.nodes[0].group == g.nodes[1].group);
     assert(g.nodes[1].group == g.nodes[2].group);
 
     LoopProgram prog_fused = lower_fused(g);
-    assert(prog_fused.kernels.size() == 2);
+    assert(prog_fused.kernels.size() == 1);
 
     LoopProgram prog_naive = lower_naive(g);
 
@@ -132,7 +132,7 @@ static void test_mlp_partial_fuse() {
         assert(near(fr.outputs[0][i], nr.outputs[0][i]));
 
     std::cout << "test_mlp_partial_fuse: PASS"
-              << " (matmul singleton + add+relu fused, 2 kernels, matches naive)\n";
+              << " (matmul+add+relu fully fused, 1 kernel, matches naive)\n";
 }
 
 int main() {

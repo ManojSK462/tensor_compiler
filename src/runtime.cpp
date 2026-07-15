@@ -51,7 +51,7 @@ RunResult compile_and_run(const std::string& src,
         bat << "@echo off\r\n";
         bat << "call \"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools"
                "\\VC\\Auxiliary\\Build\\vcvars64.bat\"\r\n";
-        bat << "cl.exe /O2 /nologo /Fe:\"" << exe_path << "\" \""
+        bat << "cl.exe /O2 /openmp /nologo /Fe:\"" << exe_path << "\" \""
             << cpp_path << "\"\r\n";
     }
 
@@ -124,7 +124,7 @@ BenchResult compile_and_bench(const LoopProgram& prog,
         bat << "@echo off\r\n";
         bat << "call \"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools"
                "\\VC\\Auxiliary\\Build\\vcvars64.bat\"\r\n";
-        bat << "cl.exe /O2 /nologo /Fe:\"" << exe_path << "\" \""
+        bat << "cl.exe /O2 /openmp /nologo /Fe:\"" << exe_path << "\" \""
             << cpp_path << "\"\r\n";
     }
 

@@ -1,5 +1,7 @@
 #include "tc/runtime.hpp"
+#include "tc/codegen.hpp"
 #include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <stdexcept>
 #include <windows.h>
@@ -93,6 +95,85 @@ RunResult compile_and_run(const std::string& src,
     if (run_ret != 0) {
         res.error = "execution failed (exit code " + std::to_string(run_ret) + ")";
         return res;
+    }
+
+    for (size_t i = 0; i < out_bufs.size(); ++i)
+        res.outputs.push_back(read_bin(out_paths[i], out_bufs[i]->shape.numel()));
+
+    res.ok = true;
+    return res;
+}
+
+BenchResult compile_and_bench(const LoopProgram& prog,
+                               const std::vector<std::vector<float>>& inputs,
+                               int warmup, int reps) {
+    BenchResult res{false, "", {}, 0.0};
+
+    std::string cpp_path    = gen("tc_bench.cpp");
+    std::string exe_path    = gen("tc_bench.exe");
+    std::string compile_bat = gen("bench_compile.bat");
+    std::string run_bat     = gen("bench_run.bat");
+    std::string stdout_path = gen("bench_stdout.txt");
+
+    { std::ofstream f(cpp_path); if (!f) { res.error = "cannot write " + cpp_path; return res; }
+      f << emit_bench_cpp(prog, warmup, reps); }
+
+    {
+        std::ofstream bat(compile_bat);
+        if (!bat) { res.error = "cannot write " + compile_bat; return res; }
+        bat << "@echo off\r\n";
+        bat << "call \"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools"
+               "\\VC\\Auxiliary\\Build\\vcvars64.bat\"\r\n";
+        bat << "cl.exe /O2 /nologo /Fe:\"" << exe_path << "\" \""
+            << cpp_path << "\"\r\n";
+    }
+
+    int compile_ret = system(compile_bat.c_str());
+    if (compile_ret != 0 || !file_exists(exe_path)) {
+        res.error = "bench compilation failed (see " + cpp_path + ")";
+        return res;
+    }
+
+    std::vector<const Buffer*> ext_bufs, out_bufs;
+    for (const Buffer& b : prog.buffers) {
+        if (b.role == BufferRole::External) ext_bufs.push_back(&b);
+        if (b.role == BufferRole::Output)   out_bufs.push_back(&b);
+    }
+
+    if (inputs.size() != ext_bufs.size()) { res.error = "input count mismatch"; return res; }
+
+    std::vector<std::string> in_paths, out_paths;
+    for (size_t i = 0; i < ext_bufs.size(); ++i) {
+        std::string p = gen("bin" + std::to_string(i) + ".bin");
+        write_bin(p, inputs[i]);
+        in_paths.push_back(p);
+    }
+    for (size_t i = 0; i < out_bufs.size(); ++i)
+        out_paths.push_back(gen("bout" + std::to_string(i) + ".bin"));
+
+    {
+        std::ofstream bat(run_bat);
+        if (!bat) { res.error = "cannot write " + run_bat; return res; }
+        bat << "@echo off\r\n";
+        bat << "\"" << exe_path << "\"";
+        for (auto& p : in_paths)  bat << " \"" << p << "\"";
+        for (auto& p : out_paths) bat << " \"" << p << "\"";
+        bat << " > \"" << stdout_path << "\"\r\n";
+    }
+
+    int run_ret = system(run_bat.c_str());
+    if (run_ret != 0) {
+        res.error = "bench execution failed (exit code " + std::to_string(run_ret) + ")";
+        return res;
+    }
+
+    {
+        std::ifstream sf(stdout_path);
+        std::string line;
+        while (std::getline(sf, line)) {
+            if (line.rfind("TIMING_MS:", 0) == 0)
+                res.median_ms = std::stod(line.substr(11));
+        }
     }
 
     for (size_t i = 0; i < out_bufs.size(); ++i)

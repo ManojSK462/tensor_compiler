@@ -111,3 +111,103 @@ std::string emit_cpp(const LoopProgram& prog) {
 
     return out.str();
 }
+
+std::string emit_bench_cpp(const LoopProgram& prog, int warmup, int reps) {
+    std::ostringstream out;
+
+    out << "#include <cmath>\n"
+           "#include <cstdint>\n"
+           "#include <cstdio>\n"
+           "#include <cstdlib>\n"
+           "#include <chrono>\n"
+           "#include <algorithm>\n\n";
+
+    for (const LoopNest& k : prog.kernels) {
+        out << "static void " << k.name << "(";
+        bool first = true;
+        for (auto bid : k.reads) {
+            if (!first) out << ", ";
+            out << "const float* " << prog.buffers[bid].name;
+            first = false;
+        }
+        for (auto bid : k.writes) {
+            if (!first) out << ", ";
+            out << "float* " << prog.buffers[bid].name;
+            first = false;
+        }
+        out << ") {\n";
+        emit_loops(out, k.loops, k.body, 1);
+        out << "}\n\n";
+    }
+
+    std::vector<const Buffer*> ext_bufs, out_bufs;
+    for (const Buffer& b : prog.buffers) {
+        if (b.role == BufferRole::External) ext_bufs.push_back(&b);
+        if (b.role == BufferRole::Output)   out_bufs.push_back(&b);
+    }
+
+    auto emit_kernel_call = [&](std::ostringstream& o, const std::string& indent) {
+        for (const LoopNest& k : prog.kernels) {
+            o << indent << k.name << "(";
+            bool first = true;
+            for (auto bid : k.reads) {
+                if (!first) o << ", ";
+                o << prog.buffers[bid].name;
+                first = false;
+            }
+            for (auto bid : k.writes) {
+                if (!first) o << ", ";
+                o << prog.buffers[bid].name;
+                first = false;
+            }
+            o << ");\n";
+        }
+    };
+
+    out << "int main(int argc, char* argv[]) {\n";
+    out << "    if (argc != " << (ext_bufs.size() + out_bufs.size() + 1) << ") return 1;\n";
+    out << "    int arg = 1;\n\n";
+
+    for (const Buffer* b : ext_bufs) {
+        int64_t n = b->shape.numel();
+        out << "    float* " << b->name << " = (float*)malloc(" << n << " * sizeof(float));\n";
+        out << "    { FILE* f = fopen(argv[arg++], \"rb\"); fread(" << b->name
+            << ", sizeof(float), " << n << ", f); fclose(f); }\n";
+    }
+    out << "\n";
+
+    for (const Buffer* b : out_bufs) {
+        int64_t n = b->shape.numel();
+        out << "    float* " << b->name << " = (float*)malloc(" << n << " * sizeof(float));\n";
+    }
+    for (const Buffer& b : prog.buffers)
+        if (b.role == BufferRole::Intermediate)
+            out << "    float* " << b.name << " = (float*)malloc("
+                << b.shape.numel() << " * sizeof(float));\n";
+    out << "\n";
+
+    out << "    for (int w = 0; w < " << warmup << "; ++w) {\n";
+    emit_kernel_call(out, "        ");
+    out << "    }\n\n";
+
+    out << "    double times[" << reps << "];\n";
+    out << "    for (int r = 0; r < " << reps << "; ++r) {\n";
+    out << "        auto _tc0 = std::chrono::high_resolution_clock::now();\n";
+    emit_kernel_call(out, "        ");
+    out << "        auto _tc1 = std::chrono::high_resolution_clock::now();\n";
+    out << "        times[r] = std::chrono::duration<double, std::milli>(_tc1 - _tc0).count();\n";
+    out << "    }\n";
+    out << "    std::sort(times, times + " << reps << ");\n";
+    out << "    printf(\"TIMING_MS: %.3f\\n\", times[" << reps / 2 << "]);\n\n";
+
+    for (const Buffer* b : out_bufs) {
+        out << "    { FILE* f = fopen(argv[arg++], \"wb\"); fwrite(" << b->name
+            << ", sizeof(float), " << b->shape.numel() << ", f); fclose(f); }\n";
+    }
+
+    for (const Buffer& b : prog.buffers)
+        out << "    free(" << b.name << ");\n";
+
+    out << "    return 0;\n}\n";
+    return out.str();
+}

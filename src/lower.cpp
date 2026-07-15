@@ -3,6 +3,7 @@
 #include <unordered_set>
 #include <sstream>
 #include <stdexcept>
+#include <algorithm>
 
 LoopProgram lower_naive(const Graph& g) {
     LoopProgram prog;
@@ -69,6 +70,24 @@ static std::string bcast_idx_fused(const Shape& in_shape, const Shape& out_shape
     return flat_idx_fused(in_shape, in_vars);
 }
 
+static TensorId find_group_output(const std::vector<const Node*>& members,
+                                   const std::unordered_set<NodeId>& member_set,
+                                   const Graph& g,
+                                   const std::function<bool(TensorId)>& is_graph_output) {
+    TensorId result = kInvalidTensor;
+    for (const Node* n : members) {
+        for (TensorId t : n->outputs) {
+            if (is_graph_output(t)) { result = t; break; }
+            for (NodeId cons : g.consumers_of(t))
+                if (!member_set.count(cons)) { result = t; break; }
+            if (result != kInvalidTensor) break;
+        }
+        if (result != kInvalidTensor) break;
+    }
+    if (result == kInvalidTensor) result = members.back()->outputs[0];
+    return result;
+}
+
 LoopProgram lower_fused(const Graph& g) {
     LoopProgram prog;
     auto& reg = OpRegistry::instance();
@@ -104,8 +123,14 @@ LoopProgram lower_fused(const Graph& g) {
         const auto& members = group_nodes[gid];
 
         bool all_ew = true;
-        for (const Node* n : members)
-            if (n->cls != OpClass::Elementwise) { all_ew = false; break; }
+        bool has_contraction = false;
+        for (const Node* n : members) {
+            if (n->cls != OpClass::Elementwise) all_ew = false;
+            if (n->cls == OpClass::Contraction) has_contraction = true;
+        }
+
+        std::unordered_set<NodeId> member_set;
+        for (const Node* n : members) member_set.insert(n->id);
 
         if (all_ew) {
             std::unordered_set<TensorId> produced;
@@ -113,22 +138,7 @@ LoopProgram lower_fused(const Graph& g) {
                 for (TensorId t : n->outputs)
                     produced.insert(t);
 
-            std::unordered_set<NodeId> member_set;
-            for (const Node* n : members)
-                member_set.insert(n->id);
-
-            TensorId group_out_tid = kInvalidTensor;
-            for (const Node* n : members) {
-                for (TensorId t : n->outputs) {
-                    if (is_graph_output(t)) { group_out_tid = t; break; }
-                    for (NodeId cons : g.consumers_of(t))
-                        if (!member_set.count(cons)) { group_out_tid = t; break; }
-                    if (group_out_tid != kInvalidTensor) break;
-                }
-                if (group_out_tid != kInvalidTensor) break;
-            }
-            if (group_out_tid == kInvalidTensor)
-                group_out_tid = members.back()->outputs[0];
+            TensorId group_out_tid = find_group_output(members, member_set, g, is_graph_output);
 
             const TensorInfo& out_ti = g.tensors[group_out_tid];
             BufferRole role = is_graph_output(group_out_tid) ? BufferRole::Output
@@ -163,7 +173,6 @@ LoopProgram lower_fused(const Graph& g) {
 
             for (const Node* n : members) {
                 const OpSpec& spec = reg.get(n->kind);
-
                 std::vector<std::string> input_exprs;
                 for (TensorId t : n->inputs) {
                     if (!produced.count(t)) {
@@ -175,13 +184,10 @@ LoopProgram lower_fused(const Graph& g) {
                         input_exprs.push_back("_t" + std::to_string(t));
                     }
                 }
-
                 std::string expr = spec.scalar_expr(input_exprs);
                 TensorId out_t = n->outputs[0];
-
                 if (!first_line) body << "\n" << cont;
                 first_line = false;
-
                 if (out_t == group_out_tid)
                     body << prog.buffers[out_bid].name << "[" << out_idx << "] = " << expr << ";";
                 else
@@ -193,10 +199,115 @@ LoopProgram lower_fused(const Graph& g) {
             nest.name = "kernel_" + std::to_string(nest.id);
             prog.kernels.push_back(std::move(nest));
 
+        } else if (has_contraction) {
+            const Node* anchor = nullptr;
+            std::vector<const Node*> epi_nodes;
+            for (const Node* n : members) {
+                if (n->cls == OpClass::Contraction) anchor = n;
+                else if (n->cls == OpClass::Elementwise) epi_nodes.push_back(n);
+            }
+
+            BufferId A_bid = tensor_to_buf.at(anchor->inputs[0]);
+            BufferId B_bid = tensor_to_buf.at(anchor->inputs[1]);
+
+            int64_t M_dim = anchor->attrs.trans_a ? prog.buffers[A_bid].shape.dims[1]
+                                                   : prog.buffers[A_bid].shape.dims[0];
+            int64_t K_dim = anchor->attrs.trans_a ? prog.buffers[A_bid].shape.dims[0]
+                                                   : prog.buffers[A_bid].shape.dims[1];
+            int64_t N_dim = anchor->attrs.trans_b ? prog.buffers[B_bid].shape.dims[0]
+                                                   : prog.buffers[B_bid].shape.dims[1];
+            int64_t KT    = std::min(K_dim, (int64_t)256);
+
+            std::string A_name = prog.buffers[A_bid].name;
+            std::string B_name = prog.buffers[B_bid].name;
+
+            TensorId mm_out_tid = anchor->outputs[0];
+
+            std::unordered_set<TensorId> produced_in_group;
+            produced_in_group.insert(mm_out_tid);
+            for (const Node* n : epi_nodes)
+                for (TensorId t : n->outputs)
+                    produced_in_group.insert(t);
+
+            TensorId group_out_tid = find_group_output(members, member_set, g, is_graph_output);
+
+            const TensorInfo& out_ti = g.tensors[group_out_tid];
+            BufferRole role = is_graph_output(group_out_tid) ? BufferRole::Output
+                                                             : BufferRole::Intermediate;
+            BufferId out_bid = prog.add_buffer(out_ti.shape, out_ti.dtype, role,
+                                               "t" + std::to_string(group_out_tid));
+            tensor_to_buf[group_out_tid] = out_bid;
+
+            LoopNest nest;
+            nest.loops = {{"i", M_dim, LoopTag::Parallel}, {"j", N_dim, LoopTag::Serial}};
+
+            std::unordered_set<TensorId> seen_ext;
+            for (TensorId t : anchor->inputs)
+                if (!seen_ext.count(t)) { nest.reads.push_back(tensor_to_buf.at(t)); seen_ext.insert(t); }
+            for (const Node* n : epi_nodes)
+                for (TensorId t : n->inputs)
+                    if (!produced_in_group.count(t) && !seen_ext.count(t)) {
+                        nest.reads.push_back(tensor_to_buf.at(t));
+                        seen_ext.insert(t);
+                    }
+            nest.writes = {out_bid};
+
+            std::string a_idx = anchor->attrs.trans_a
+                ? "k * " + std::to_string(M_dim) + " + i"
+                : "i * " + std::to_string(K_dim) + " + k";
+            std::string b_idx = anchor->attrs.trans_b
+                ? "j * " + std::to_string(K_dim) + " + k"
+                : "k * " + std::to_string(N_dim) + " + j";
+
+            std::ostringstream body;
+            body << "float acc = 0.f;\n";
+            body << "        for (int64_t ko = 0; ko < " << K_dim << "; ko += " << KT << ") {\n";
+            body << "            int64_t ke = ko + " << KT << " < " << K_dim
+                 << " ? ko + " << KT << " : " << K_dim << ";\n";
+            body << "            for (int64_t k = ko; k < ke; ++k)\n";
+            body << "                acc += " << A_name << "[" << a_idx << "] * "
+                 << B_name << "[" << b_idx << "];\n";
+            body << "        }";
+
+            std::unordered_set<TensorId> epi_produced;
+            epi_produced.insert(mm_out_tid);
+            std::vector<std::string> ij_vars = {"i", "j"};
+            Shape out_shape = out_ti.shape;
+
+            for (const Node* n : epi_nodes) {
+                const OpSpec& spec = reg.get(n->kind);
+                std::vector<std::string> input_exprs;
+                for (TensorId t : n->inputs) {
+                    if (epi_produced.count(t)) {
+                        input_exprs.push_back(t == mm_out_tid ? "acc" : "_ep" + std::to_string(t));
+                    } else {
+                        BufferId bid = tensor_to_buf.at(t);
+                        const Buffer& buf = prog.buffers[bid];
+                        std::string idx = bcast_idx_fused(buf.shape, out_shape, ij_vars);
+                        input_exprs.push_back(buf.name + "[" + idx + "]");
+                    }
+                }
+                std::string expr = spec.scalar_expr(input_exprs);
+                TensorId out_t = n->outputs[0];
+                epi_produced.insert(out_t);
+                body << "\n        ";
+                if (out_t == group_out_tid)
+                    body << prog.buffers[out_bid].name << "[i * " << N_dim << " + j] = " << expr << ";";
+                else
+                    body << "float _ep" << out_t << " = " << expr << ";";
+            }
+
+            if (epi_nodes.empty())
+                body << "\n        " << prog.buffers[out_bid].name << "[i * " << N_dim << " + j] = acc;";
+
+            nest.body = body.str();
+            nest.id   = static_cast<KernelId>(prog.kernels.size());
+            nest.name = "kernel_" + std::to_string(nest.id);
+            prog.kernels.push_back(std::move(nest));
+
         } else {
             for (const Node* n : members) {
                 const OpSpec& spec = reg.get(n->kind);
-
                 std::vector<BufferId> in_bufs;
                 for (TensorId tid : n->inputs)
                     in_bufs.push_back(tensor_to_buf.at(tid));

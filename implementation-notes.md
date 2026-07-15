@@ -223,4 +223,73 @@ Internal-to-group tensors contribute to `bytes_unfused` (they'd round-trip in th
 
 ---
 
-*Next: M3 — Tiled matmul schedule, epilogue fusion onto the matmul anchor.*
+---
+
+## M3 — Tiled matmul + epilogue fusion  ✅
+
+### What was built
+
+Two-step fusion extended to support contraction anchors, tiled matmul kernel with K-loop blocking, and epilogue chains (elementwise nodes consuming matmul output) fused into the same kernel body using register-resident intermediates. A benchmark harness with chrono timing added.
+
+### New / changed files
+
+```
+src/
+  fusion.cpp   — extended with step 3: epilogue attach onto anchor groups
+  lower.cpp    — has_contraction branch in lower_fused; tiled matmul body + epilogue emission
+  codegen.cpp  — emit_bench_cpp: same kernels as emit_cpp, timed loop in main()
+  runtime.cpp  — compile_and_bench: generates tc_bench.{cpp,exe}, parses TIMING_MS stdout
+
+include/tc/
+  codegen.hpp  — added emit_bench_cpp declaration
+  runtime.hpp  — added BenchResult struct and compile_and_bench declaration
+
+tests/
+  test_m3.cpp  — test_epilogue_fuses, test_two_layer_mlp_fuses, test_benchmark
+```
+
+### Extended fusion algorithm
+
+`fuse(Graph&)` now runs three steps:
+
+1. Singleton assignment (same as M2).
+2. **Step 3 — Epilogue attach**: for each elementwise node N whose input comes from an anchor group (a group containing a Contraction node), if the tensor has exactly one consumer and N's output shape matches the anchor's output shape, merge N's group into the anchor group.
+3. **Step 4 — Elementwise vertical** (same as M2 step 2, but skips anchor groups): pure-elementwise producers fold into their consumer group.
+
+Step 3 runs before step 4 so that epilogue nodes attached to an anchor cannot be further merged by step 4 (guarded by `group_has_anchor()`).
+
+### Tiled matmul + epilogue lowering
+
+The `has_contraction` branch in `lower_fused`:
+
+- Outer loops: `[i(Parallel, M), j(Serial, N)]`.
+- K-tiling: `KT = min(K, 256)`. Body contains a `ko`-tiled reduction loop with inner `k` loop, accumulating into `float acc`.
+- Epilogue chain: each elementwise node in the group is emitted in topological order after the `ko` loop closes. External inputs use `bcast_idx_fused` against the `{i,j}` iteration space. Internal (group-produced) tensors use the register name: `"acc"` for the matmul output, `"_epN"` (where N is the TensorId) for prior epilogue outputs. The group's final output writes directly to the output buffer (`t5[i*N+j] = expr;`).
+- No intermediate buffer is allocated for `acc` or any epilogue value.
+
+Buffer reference fix: A and B buffer names and shapes are copied into local strings/variables before `prog.add_buffer(...)` is called, preventing use-after-reallocation of `std::vector<Buffer>` references.
+
+### Benchmark harness
+
+`emit_bench_cpp` generates a self-contained binary with:
+- Same kernel functions as `emit_cpp`.
+- `main()`: warmup loop (default 2 reps), timed loop (default 10 reps) using `std::chrono::high_resolution_clock`, sorts times, prints `TIMING_MS: X.XXX` to stdout.
+- Timing variables named `_tc0`/`_tc1` (not `t0`/`t1`) to avoid shadowing buffer variables.
+
+`compile_and_bench` in `runtime.cpp` generates `tc_bench.{cpp,exe}` (separate files from `tc_gen.*`), captures stdout via `bench_run.bat > bench_stdout.txt`, parses the `TIMING_MS:` line, and returns `BenchResult{ok, error, outputs, median_ms}`.
+
+### Test results
+
+| Test | Result |
+|---|---|
+| `test_epilogue_fuses` | matmul+add+relu → 1 fused kernel; output matches naive within 1e-3 |
+| `test_two_layer_mlp_fuses` | 2-layer MLP → 2 fused kernels; output matches naive |
+| `test_benchmark` (256×256) | unfused: 1793 KB traffic, fused: 769 KB traffic, saved: 1024 KB (57%); naive: 31.5 ms, fused: 53 ms |
+
+The fused kernel is slower on this machine (no OpenMP, small matrix, Windows subprocess overhead). The memory traffic model confirms correct analytical savings. Runtime speedup is expected to be visible on larger shapes with OpenMP enabled (`/openmp` flag).
+
+### Deviations from design doc
+
+- OpenMP not enabled in `cl.exe` invocations (no `/openmp` flag). `#pragma omp parallel for` is present in generated code but ignored. This is why the fused kernel (which has more loop overhead from K-tiling) runs slower than naive.
+- K-tiling uses a fixed `KT=min(K,256)`. For K≤256, this produces a single tile (trivial tiling). Actual cache-locality benefit requires K>256.
+- Prologue fusion (elementwise producers before matmul) is deferred to M4+.

@@ -342,3 +342,58 @@ The `has_reduction` branch in `lower_fused`:
 
 - Softmax epilogue fusion deferred — three-pass body would require recomputing exp to inline an epilogue.
 - Prologue fusion (elementwise producers before the reduction) deferred to M5+.
+
+---
+
+## M5 — Buffer reuse, attention, end-to-end benchmark  ✅
+
+### What was built
+
+Liveness-based intermediate buffer slot assignment that lets non-overlapping buffers share the same `malloc`. A scaled dot-product attention graph (Q@K^T → scale → softmax → @V) as the real-model end-to-end test. A 2-layer MLP benchmark comparing fused vs naive throughput.
+
+### New / changed files
+
+```
+include/tc/
+  loop_ir.hpp      — added slot_id (int32_t, default -1) to Buffer
+  buffer_reuse.hpp — assign_buffer_slots(LoopProgram&)
+
+src/
+  buffer_reuse.cpp — liveness computation + greedy interval slot assignment
+  codegen.cpp      — emit_cpp / emit_bench_cpp use slot-pooled malloc when slot_id >= 0
+
+tests/
+  test_m5.cpp      — test_buffer_reuse, test_attention, test_e2e_benchmark
+```
+
+### Buffer reuse algorithm
+
+`assign_buffer_slots(LoopProgram& prog)`:
+
+1. For each `Intermediate` buffer, scan kernels to find `first_write` and `last_read` kernel indices.
+2. Sort intervals by `first_write`.
+3. Greedy slot assignment: for each interval, assign to the first slot whose `last_read < interval.first_write`; otherwise open a new slot. Track `max_elements` per slot.
+4. Write `slot_id` back onto each `Buffer`.
+
+In `emit_cpp`/`emit_bench_cpp`: if any intermediate has `slot_id >= 0`, emit one `_slot_N = malloc(max_elems)` per slot and assign buffer pointers as `float* tN = _slot_K;`. Free slots (not individual pointers) at the end.
+
+For a depth-N pipeline of fused groups, at most 2 slots are needed regardless of depth (alternating live ranges). For 4 groups / 3 intermediates: slots = 2, saving 33% of intermediate memory.
+
+### Attention graph
+
+`Q @ K^T` (trans_b=true) + `mul(scale)` → fused 1 kernel via M3 epilogue attach. Softmax singleton. `@ V` singleton. Total: 3 kernels vs 4 naive. Correctness verified element-wise against naive within 1e-3.
+
+### Test results
+
+| Test | Result |
+|---|---|
+| `test_buffer_reuse` | 4-layer MLP: 3 intermediates → 2 slots; output matches |
+| `test_attention` | Q@K^T/√D → softmax → @V; fused matches naive |
+| `test_e2e_benchmark` | 256×(256→128→64) MLP: naive 14.7 ms, fused 14.3 ms, 1.03× |
+
+The modest e2e speedup is expected without OpenMP — the dominant cost is sequential matmul. The memory-traffic reduction is the primary win in this configuration.
+
+### Deviations from design doc
+
+- OpenMP (`/openmp`) not added to `cl.exe` invocations; all `#pragma omp parallel for` are no-ops.
+- Multi-head attention (batched, multiple heads) not implemented — single-head 2-D version covers the core fusion and correctness story.

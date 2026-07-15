@@ -74,11 +74,26 @@ std::string emit_cpp(const LoopProgram& prog) {
         out << "    float* " << b->name << " = (float*)malloc(" << n << " * sizeof(float));\n";
     }
 
+    std::vector<int64_t> slot_sizes;
     for (const Buffer& b : prog.buffers) {
-        if (b.role == BufferRole::Intermediate) {
+        if (b.role != BufferRole::Intermediate) continue;
+        if (b.slot_id >= 0) {
+            if (b.slot_id >= static_cast<int32_t>(slot_sizes.size()))
+                slot_sizes.resize(b.slot_id + 1, 0);
+            if (b.shape.numel() > slot_sizes[b.slot_id])
+                slot_sizes[b.slot_id] = b.shape.numel();
+        }
+    }
+    for (int32_t si = 0; si < static_cast<int32_t>(slot_sizes.size()); ++si)
+        out << "    float* _slot_" << si << " = (float*)malloc("
+            << slot_sizes[si] << " * sizeof(float));\n";
+    for (const Buffer& b : prog.buffers) {
+        if (b.role != BufferRole::Intermediate) continue;
+        if (b.slot_id >= 0)
+            out << "    float* " << b.name << " = _slot_" << b.slot_id << ";\n";
+        else
             out << "    float* " << b.name << " = (float*)malloc("
                 << b.shape.numel() << " * sizeof(float));\n";
-        }
     }
     out << "\n";
 
@@ -104,8 +119,11 @@ std::string emit_cpp(const LoopProgram& prog) {
             << ", sizeof(float), " << b->shape.numel() << ", f); fclose(f); }\n";
     }
 
+    for (int32_t si = 0; si < static_cast<int32_t>(slot_sizes.size()); ++si)
+        out << "    free(_slot_" << si << ");\n";
     for (const Buffer& b : prog.buffers)
-        out << "    free(" << b.name << ");\n";
+        if (!(b.role == BufferRole::Intermediate && b.slot_id >= 0))
+            out << "    free(" << b.name << ");\n";
 
     out << "    return 0;\n}\n";
 
@@ -180,10 +198,27 @@ std::string emit_bench_cpp(const LoopProgram& prog, int warmup, int reps) {
         int64_t n = b->shape.numel();
         out << "    float* " << b->name << " = (float*)malloc(" << n << " * sizeof(float));\n";
     }
-    for (const Buffer& b : prog.buffers)
-        if (b.role == BufferRole::Intermediate)
+    std::vector<int64_t> bslot_sizes;
+    for (const Buffer& b : prog.buffers) {
+        if (b.role != BufferRole::Intermediate) continue;
+        if (b.slot_id >= 0) {
+            if (b.slot_id >= static_cast<int32_t>(bslot_sizes.size()))
+                bslot_sizes.resize(b.slot_id + 1, 0);
+            if (b.shape.numel() > bslot_sizes[b.slot_id])
+                bslot_sizes[b.slot_id] = b.shape.numel();
+        }
+    }
+    for (int32_t si = 0; si < static_cast<int32_t>(bslot_sizes.size()); ++si)
+        out << "    float* _slot_" << si << " = (float*)malloc("
+            << bslot_sizes[si] << " * sizeof(float));\n";
+    for (const Buffer& b : prog.buffers) {
+        if (b.role != BufferRole::Intermediate) continue;
+        if (b.slot_id >= 0)
+            out << "    float* " << b.name << " = _slot_" << b.slot_id << ";\n";
+        else
             out << "    float* " << b.name << " = (float*)malloc("
                 << b.shape.numel() << " * sizeof(float));\n";
+    }
     out << "\n";
 
     out << "    for (int w = 0; w < " << warmup << "; ++w) {\n";
@@ -205,8 +240,11 @@ std::string emit_bench_cpp(const LoopProgram& prog, int warmup, int reps) {
             << ", sizeof(float), " << b->shape.numel() << ", f); fclose(f); }\n";
     }
 
+    for (int32_t si = 0; si < static_cast<int32_t>(bslot_sizes.size()); ++si)
+        out << "    free(_slot_" << si << ");\n";
     for (const Buffer& b : prog.buffers)
-        out << "    free(" << b.name << ");\n";
+        if (!(b.role == BufferRole::Intermediate && b.slot_id >= 0))
+            out << "    free(" << b.name << ");\n";
 
     out << "    return 0;\n}\n";
     return out.str();

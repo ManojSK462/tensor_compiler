@@ -11,11 +11,12 @@ static constexpr BufferId kInvalidBuffer = UINT32_MAX;
 enum class BufferRole { External, Intermediate, Output };
 
 struct Buffer {
-    BufferId   id;
-    Shape      shape;
-    DType      dtype;
-    BufferRole role;
+    BufferId    id;
+    Shape       shape;
+    DType       dtype;
+    BufferRole  role;
     std::string name;
+    int32_t     slot_id = -1;
 };
 
 enum class LoopTag { Serial, Parallel, Vectorize, Reduce };

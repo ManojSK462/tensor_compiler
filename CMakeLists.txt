@@ -21,6 +21,7 @@ add_library(tc STATIC
     src/runtime.cpp
     src/fusion.cpp
     src/analyze.cpp
+    src/buffer_reuse.cpp
 )
 target_include_directories(tc PUBLIC include)
 
@@ -38,3 +39,6 @@ target_link_libraries(test_m3 PRIVATE tc)
 
 add_executable(test_m4 tests/test_m4.cpp)
 target_link_libraries(test_m4 PRIVATE tc)
+
+add_executable(test_m5 tests/test_m5.cpp)
+target_link_libraries(test_m5 PRIVATE tc)
